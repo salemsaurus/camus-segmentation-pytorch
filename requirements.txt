@@ -1,0 +1,5 @@
+torch
+SimpleITK
+numpy
+Pillow
+scikit-image

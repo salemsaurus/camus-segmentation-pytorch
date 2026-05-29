@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# CAMUS imaging data (download locally; too large for GitHub)
+database_nifti/
+checkpoints/

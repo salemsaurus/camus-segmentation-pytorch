@@ -63,10 +63,10 @@ class CamusUnet1(nn.Module):
             self.UpSampling4 = nn.ConvTranspose2d(in_channels=32, out_channels=32, kernel_size=(2, 2), stride=(2, 2))
 
         self.u1 = double_conv2d(256, 128)  # stacking prev layer..so size increased by 2
-        self.u2 = double_conv2d(128, 64)
-        self.u3 = double_conv2d(64, 32)
-        self.u4 = double_conv2d(64, 16)  # Layer Up layer: 32 + 32 =64 to Double conv to 16
-        self.out = nn.Conv2d(in_channels=16, out_channels=4, kernel_size=(1, 1))
+        self.u2 = double_conv2d(192, 64)
+        self.u3 = double_conv2d(96, 32)
+        self.u4 = double_conv2d(64, 32)  # Layer Up layer: 32 + 32 =64 to Double conv to 32
+        self.out = nn.Conv2d(in_channels=32, out_channels=4, kernel_size=(1, 1))
 
     def forward(self, image):
         """
@@ -102,18 +102,34 @@ class CamusUnet1(nn.Module):
         Decoder
         """
         up_sampling1 = self.UpSampling1(d6_out)
+        assert up_sampling1.shape[2:] == d5_out.shape[2:], (
+            f"Decoder stage 1 spatial mismatch: {up_sampling1.shape[2:]} vs {d5_out.shape[2:]}"
+        )
         u1_out = self.u1(torch.cat([d5_out, up_sampling1], axis=1))
 
-        up_sampling2 = self.UpSampling1(u1_out)
-        u2_out = self.u1(torch.cat([d4_out, up_sampling2], axis=1))
+        up_sampling2 = self.UpSampling2(u1_out)
+        assert up_sampling2.shape[2:] == d4_out.shape[2:], (
+            f"Decoder stage 2 spatial mismatch: {up_sampling2.shape[2:]} vs {d4_out.shape[2:]}"
+        )
+        u2_out = self.u2(torch.cat([d4_out, up_sampling2], axis=1))
 
-        up_sampling3 = self.UpSampling2(u2_out)
-        u3_out = self.u2(torch.cat([d3_out, up_sampling3], axis=1))
+        up_sampling3 = self.UpSampling3(u2_out)
+        assert up_sampling3.shape[2:] == d3_out.shape[2:], (
+            f"Decoder stage 3 spatial mismatch: {up_sampling3.shape[2:]} vs {d3_out.shape[2:]}"
+        )
+        u3_out = self.u3(torch.cat([d3_out, up_sampling3], axis=1))
 
-        up_sampling4 = self.UpSampling3(u3_out)
-        u4_out = self.u3(torch.cat([d2_out, up_sampling4], axis=1))
+        up_sampling4 = self.UpSampling4(u3_out)
+        assert up_sampling4.shape[2:] == d2_out.shape[2:], (
+            f"Decoder stage 4 spatial mismatch: {up_sampling4.shape[2:]} vs {d2_out.shape[2:]}"
+        )
+        u4_out = self.u4(torch.cat([d2_out, up_sampling4], axis=1))
 
+        # Last skip with highest-resolution encoder features.
         up_sampling5 = self.UpSampling4(u4_out)
+        assert up_sampling5.shape[2:] == d1_out.shape[2:], (
+            f"Decoder stage 5 spatial mismatch: {up_sampling5.shape[2:]} vs {d1_out.shape[2:]}"
+        )
         u5_out = self.u4(torch.cat([d1_out, up_sampling5], axis=1))
 
         final_out = self.out(u5_out)

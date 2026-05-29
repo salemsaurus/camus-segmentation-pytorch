@@ -1,0 +1,7 @@
+The split that is given corresponds to the one used in our paper:
+
+S. Leclerc, E. Smistad, J. Pedrosa, A. Ostvik, et al.
+"Deep Learning for Segmentation using an Open Large-Scale Dataset in 2D Echocardiography" in IEEE Transactions on Medical Imaging, vol. 38, no. 9, pp. 2198-2210, Sept. 2019
+doi: 10.1109/TMI.2019.2900516
+
+However, please note that a few corrections have been made, resulting in slight changes in distribution compared with the figures given in the article.
