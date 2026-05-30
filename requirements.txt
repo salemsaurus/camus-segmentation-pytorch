@@ -3,3 +3,6 @@ SimpleITK
 numpy
 Pillow
 scikit-image
+scipy
+scikit-learn
+matplotlib
