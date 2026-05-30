@@ -1,234 +1,283 @@
+"""
+Faithful CAMUS U-Net1 training with true multiclass segmentation.
+
+Multiclass structure (4 classes):
+    - Class 0: Background
+    - Class 1: LV cavity
+    - Class 2: Myocardium
+    - Class 3: Left atrium
+
+Patient-level splitting is mandatory: never split by frame/view/phase.
+Uses official CAMUS dataset splits (400 train, 50 val, 50 test).
+"""
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List
 
+import numpy as np
 import torch
-import torch.nn.functional as F
-from torch import nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 
-from camus_unet.camus_unet1 import CamusUnet1
-
-try:
-    import SimpleITK as sitk
-except ImportError as exc:
-    raise ImportError(
-        "SimpleITK is required to read .nii.gz CAMUS files. Install it with: pip install SimpleITK"
-    ) from exc
-
-
-def read_split_file(split_path: Path) -> List[str]:
-    with split_path.open("r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
-
-
-def load_nifti(path: Path) -> torch.Tensor:
-    image = sitk.ReadImage(str(path))
-    array = sitk.GetArrayFromImage(image)  # [D, H, W] or [H, W]
-    tensor = torch.from_numpy(array).float()
-    if tensor.ndim == 3:
-        tensor = tensor[0]
-    return tensor
-
-
-class CamusSegmentationDataset(Dataset):
-    def __init__(
-        self,
-        patients: List[str],
-        nifti_root: Path,
-        image_size: Tuple[int, int],
-        phases: Tuple[str, ...] = ("ED", "ES"),
-        views: Tuple[str, ...] = ("2CH", "4CH"),
-    ) -> None:
-        self.samples = []
-        self.nifti_root = nifti_root
-        self.image_size = image_size
-
-        for patient in patients:
-            patient_dir = nifti_root / patient
-            for view in views:
-                for phase in phases:
-                    image_name = f"{patient}_{view}_{phase}.nii.gz"
-                    mask_name = f"{patient}_{view}_{phase}_gt.nii.gz"
-                    image_path = patient_dir / image_name
-                    mask_path = patient_dir / mask_name
-                    if image_path.exists() and mask_path.exists():
-                        self.samples.append((image_path, mask_path))
-
-        if not self.samples:
-            raise RuntimeError(
-                f"No training samples found under {nifti_root}. "
-                "Check your split files and dataset paths."
-            )
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int):
-        image_path, mask_path = self.samples[idx]
-        image = load_nifti(image_path)
-        mask = load_nifti(mask_path).long()
-
-        image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-        mask = mask.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
-
-        image = F.interpolate(image, size=self.image_size, mode="bilinear", align_corners=False)
-        mask = F.interpolate(mask, size=self.image_size, mode="nearest")
-
-        image = image.squeeze(0)  # [1, H, W]
-        mask = mask.squeeze(0).squeeze(0).long()  # [H, W]
-
-        # Per-sample normalization keeps intensity scale stable across patients.
-        img_min = image.min()
-        img_max = image.max()
-        image = (image - img_min) / (img_max - img_min + 1e-8)
-
-        return image, mask
-
-
-def make_model() -> nn.Module:
-    return CamusUnet1()
-
-
-def multiclass_dice_score(logits: torch.Tensor, target: torch.Tensor, num_classes: int = 4) -> float:
-    pred = torch.argmax(logits, dim=1)
-    dice_scores = []
-    for cls in range(num_classes):
-        pred_cls = (pred == cls).float()
-        target_cls = (target == cls).float()
-        intersection = (pred_cls * target_cls).sum(dim=(1, 2))
-        denom = pred_cls.sum(dim=(1, 2)) + target_cls.sum(dim=(1, 2))
-        dice = (2.0 * intersection + 1e-6) / (denom + 1e-6)
-        dice_scores.append(dice.mean().item())
-    return sum(dice_scores) / len(dice_scores)
-
-
-def dice_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int = 4) -> torch.Tensor:
-    probs = torch.softmax(logits, dim=1)
-    target_one_hot = F.one_hot(target, num_classes=num_classes).permute(0, 3, 1, 2).float()
-
-    dims = (0, 2, 3)
-    intersection = (probs * target_one_hot).sum(dim=dims)
-    cardinality = probs.sum(dim=dims) + target_one_hot.sum(dim=dims)
-    dice = (2.0 * intersection + 1e-6) / (cardinality + 1e-6)
-    return 1.0 - dice.mean()
-
-
-def combined_ce_dice_loss(
-    logits: torch.Tensor, target: torch.Tensor, ce_weight: float = 1.0, dice_weight: float = 1.0
-) -> torch.Tensor:
-    ce = F.cross_entropy(logits, target)
-    d_loss = dice_loss(logits, target)
-    return ce_weight * ce + dice_weight * d_loss
+from dataset import CamusPatientDataset
+from losses import segmentation_loss
+from metrics import compute_batch_metrics
+from model import CamusUnet1
+from utils import (
+    list_patients,
+    load_official_camus_splits,
+    postprocess_prediction,
+    save_dice_curves,
+    save_json,
+    save_loss_curves,
+    save_overlay,
+    seed_everything,
+)
 
 
 def run_epoch(
-    model: nn.Module,
+    model: CamusUnet1,
     loader: DataLoader,
     device: torch.device,
-    optimizer: Adam = None,
-) -> Tuple[float, float]:
-    is_train = optimizer is not None
-    model.train(is_train)
+    num_classes: int,
+    *,
+    optimizer=None,
+    scaler: GradScaler | None = None,
+    use_amp: bool = False,
+    postprocess: bool = False,
+) -> Dict[str, float]:
+    train_mode = optimizer is not None
+    model.train(train_mode)
 
     total_loss = 0.0
-    total_dice = 0.0
+    metric_sums = {"dice": 0.0, "iou": 0.0, "hausdorff": 0.0, "msd": 0.0}
+    n_batches = 0
 
     for images, masks in loader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
 
-        if is_train:
-            optimizer.zero_grad()
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
 
-        with torch.set_grad_enabled(is_train):
+        with autocast(enabled=use_amp):
             logits = model(images)
-            loss = combined_ce_dice_loss(logits, masks)
-            if is_train:
+            loss = segmentation_loss(logits, masks, num_classes=num_classes)
+
+        if train_mode:
+            if scaler is not None and use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 loss.backward()
                 optimizer.step()
 
-        total_loss += loss.item()
-        total_dice += multiclass_dice_score(logits.detach(), masks)
+        with torch.no_grad():
+            if postprocess and num_classes == 1:
+                probs = torch.sigmoid(logits)
+                pred = (probs > 0.5).float()
+            else:
+                pred = logits
 
-    n_batches = len(loader)
-    return total_loss / n_batches, total_dice / n_batches
+            batch_metrics = compute_batch_metrics(pred, masks, num_classes)
+            total_loss += loss.item()
+            for k in metric_sums:
+                metric_sums[k] += batch_metrics[k]
+            n_batches += 1
+
+    out = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
+    out["loss"] = total_loss / max(n_batches, 1)
+    return out
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train CAMUS U-Net segmentation model.")
-    parser.add_argument("--nifti-root", type=Path, default=Path("database_nifti"))
-    parser.add_argument("--split-root", type=Path, default=Path("database_split"))
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--height", type=int, default=256)
-    parser.add_argument("--width", type=int, default=256)
-    parser.add_argument("--output", type=Path, default=Path("checkpoints"))
-    args = parser.parse_args()
+def train_one_fold(
+    fold: int,
+    train_patients: List[str],
+    val_patients: List[str],
+    test_patients: List[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Dict[str, float]:
+    fold_dir = args.output
+    fold_dir.mkdir(parents=True, exist_ok=True)
 
-    train_patients = read_split_file(args.split_root / "subgroup_training.txt")
-    val_patients = read_split_file(args.split_root / "subgroup_validation.txt")
+    tr_patients, va_patients = train_patients, val_patients
 
-    image_size = (args.height, args.width)
-    train_ds = CamusSegmentationDataset(train_patients, args.nifti_root, image_size=image_size)
-    val_ds = CamusSegmentationDataset(val_patients, args.nifti_root, image_size=image_size)
+    train_ds = CamusPatientDataset(
+        tr_patients, args.nifti_root, image_size=(args.height, args.width), augment=True, seed=args.seed
+    )
+    val_ds = CamusPatientDataset(
+        va_patients, args.nifti_root, image_size=(args.height, args.width), augment=False, seed=args.seed
+    )
+    test_ds = CamusPatientDataset(
+        test_patients, args.nifti_root, image_size=(args.height, args.width), augment=False, seed=args.seed
+    )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = make_model().to(device)
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    model = CamusUnet1(
+        num_classes=args.num_classes,
+        bilinear=True,
+        dropout=args.dropout,
+    ).to(device)
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    best_val_loss = float("inf")
-    best_ckpt = args.output / "unet1_best.pt"
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"patients train/val/test = {len(tr_patients)}/{len(va_patients)}/{len(test_patients)}")
+    print(f"samples train/val/test = {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+    print(f"parameters = {num_params:,}")
 
-    print(f"Device: {device}")
-    print(f"Training samples: {len(train_ds)} | Validation samples: {len(val_ds)}")
+    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    scaler = GradScaler(enabled=args.amp and device.type == "cuda")
+    use_amp = args.amp and device.type == "cuda"
+
+    history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": []}
+    best_val = float("inf")
+    best_path = fold_dir / "best_model.pt"
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_dice = run_epoch(model, train_loader, device, optimizer=optimizer)
-        val_loss, val_dice = run_epoch(model, val_loader, device, optimizer=None)
+        tr = run_epoch(
+            model, train_loader, device, args.num_classes, optimizer=optimizer, scaler=scaler, use_amp=use_amp
+        )
+        va = run_epoch(model, val_loader, device, args.num_classes, postprocess=args.postprocess_eval)
+
+        history["train_loss"].append(tr["loss"])
+        history["val_loss"].append(va["loss"])
+        history["train_dice"].append(tr["dice"])
+        history["val_dice"].append(va["dice"])
+
+        scheduler.step(va["loss"])
 
         print(
-            f"Epoch {epoch:03d}/{args.epochs} | "
-            f"train_loss={train_loss:.4f} train_dice={train_dice:.4f} | "
-            f"val_loss={val_loss:.4f} val_dice={val_dice:.4f}"
+            f"epoch {epoch:03d}/{args.epochs} | "
+            f"train loss={tr['loss']:.4f} dice={tr['dice']:.4f} | "
+            f"val loss={va['loss']:.4f} dice={va['dice']:.4f}"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if va["loss"] < best_val:
+            best_val = va["loss"]
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_name": "unet1",
+                    "model_name": "camus_unet1",
+                    "num_classes": args.num_classes,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "val_dice": val_dice,
-                    "image_size": image_size,
+                    "val_loss": va["loss"],
+                    "val_dice": va["dice"],
+                    "image_size": (args.height, args.width),
                 },
-                best_ckpt,
+                best_path,
             )
-            print(f"Saved new best checkpoint: {best_ckpt}")
 
-    print(f"Training complete. Best val_loss={best_val_loss:.4f}")
+    save_loss_curves(history, fold_dir / "loss_curve.png")
+    save_dice_curves(history, fold_dir / "dice_curve.png")
+
+    # Test fold evaluation with best checkpoint
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    test_metrics = run_epoch(
+        model, test_loader, device, args.num_classes, postprocess=args.postprocess_eval
+    )
+
+    # Save a few overlays from test set
+    overlay_dir = fold_dir / "overlays"
+    model.eval()
+    saved = 0
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            logits = model(images)
+            for i in range(images.size(0)):
+                if saved >= args.max_overlays:
+                    break
+                img = images[i, 0].cpu().numpy()
+                gt = masks[i].cpu().numpy()
+                if args.num_classes == 1:
+                    pred = (torch.sigmoid(logits[i : i + 1]) > 0.5).squeeze().cpu().numpy().astype(np.uint8)
+                else:
+                    pred = torch.argmax(logits[i : i + 1], dim=1).squeeze().cpu().numpy().astype(np.uint8)
+                if args.postprocess_eval:
+                    pred = postprocess_prediction(pred)
+                save_overlay(img, gt.astype(np.uint8), pred, overlay_dir / f"sample_{saved:03d}.png")
+                saved += 1
+            if saved >= args.max_overlays:
+                break
+
+    save_json(fold_dir / "test_metrics.json", test_metrics)
+    return test_metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="CAMUS U-Net1 faithful training using official 400/50/50 patient-level splits")
+    parser.add_argument("--nifti-root", type=Path, default=Path("database_nifti"))
+    parser.add_argument("--split-root", type=Path, default=Path("database_split"), help="Folder containing official CAMUS split files")
+    parser.add_argument("--output", type=Path, default=Path("runs/training"))
+    parser.add_argument("--num-classes", type=int, default=4, help="1=binary, >1=multi-class")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--height", type=int, default=256)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", action="store_false", dest="amp")
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--postprocess-eval", action="store_true", default=True)
+    parser.add_argument("--max-overlays", type=int, default=8)
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    official_train, official_val, official_test = load_official_camus_splits(args.split_root)
+    patients = list_patients(args.nifti_root)
+    missing = set(official_train + official_val + official_test) - set(patients)
+    if missing:
+        raise RuntimeError(
+            "The official split references patient directories missing from the NIfTI root: "
+            f"{sorted(missing)}"
+        )
+
+    metrics = train_one_fold(
+        fold=0,
+        train_patients=official_train,
+        val_patients=official_val,
+        test_patients=official_test,
+        args=args,
+        device=device,
+    )
+
+    save_json(args.output / "test_metrics.json", metrics)
+    print("Training complete. Results saved to:", args.output)
 
 
 if __name__ == "__main__":
