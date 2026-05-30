@@ -15,23 +15,32 @@ def _get_class_masks(
     Extract class-specific binary masks.
 
     For multiclass:
-        pred: [B, C, H, W] logits
-        target: [B, H, W] class indices
-        Returns: pred_classes, target_classes where each is [B, H, W] with class index or 0
-
+        pred: [B, C, H, W] logits or [B, H, W] class labels
+        target: [B, H, W] or [B, 1, H, W] class indices
     For binary:
-        pred: [B, 1, H, W] logits
+        pred: [B, 1, H, W] logits or [B, H, W] binary labels
         target: [B, H, W] or [B, 1, H, W]
-        Returns: binary masks
     """
     if num_classes == 1:
-        pred_m = (torch.sigmoid(pred) > 0.5).squeeze(1).cpu().numpy().astype(np.int32)
+        if pred.ndim == 4:
+            pred_m = (torch.sigmoid(pred) > 0.5).squeeze(1)
+        elif pred.ndim == 3:
+            pred_m = (pred > 0).long()
+        else:
+            raise ValueError("Binary predictions must be either logits [B,1,H,W] or labels [B,H,W]")
+
         if target.ndim == 4:
             target = target.squeeze(1)
-        tgt_m = (target > 0).cpu().numpy().astype(np.int32)
+        tgt_m = (target > 0).long().cpu().numpy().astype(np.int32)
+        pred_m = pred_m.cpu().numpy().astype(np.int32)
     else:
-        # Multiclass: argmax for predictions, keep target as-is
-        pred_m = torch.argmax(pred, dim=1).cpu().numpy().astype(np.int32)
+        if pred.ndim == 4:
+            pred_m = torch.argmax(pred, dim=1)
+        elif pred.ndim == 3:
+            pred_m = pred.long()
+        else:
+            raise ValueError("Multiclass predictions must be either logits [B,C,H,W] or labels [B,H,W]")
+        pred_m = pred_m.cpu().numpy().astype(np.int32)
         tgt_m = target.cpu().numpy().astype(np.int32)
     return pred_m, tgt_m
 

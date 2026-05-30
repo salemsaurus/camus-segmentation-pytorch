@@ -9,12 +9,19 @@ Multiclass structure (4 classes):
 
 Patient-level splitting is mandatory: never split by frame/view/phase.
 Uses official CAMUS dataset splits (400 train, 50 val, 50 test).
+
+Default hyperparameters are set to the original U-Net1 paper style:
+    - batch size = 32
+    - learning rate = 1e-3
+    - weight decay = 0.0
+    - dropout = 0.0
+    - no normalization
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -39,6 +46,35 @@ from utils import (
 )
 
 
+def seed_worker(worker_id: int) -> None:
+    import random
+    import numpy as np
+
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+def prepare_predictions(
+    logits: torch.Tensor,
+    num_classes: int,
+    postprocess_eval: bool,
+) -> torch.Tensor:
+    """Convert model output to class labels and optionally apply post-processing."""
+    if num_classes == 1:
+        preds = (torch.sigmoid(logits) > 0.5).squeeze(1).long()
+    else:
+        preds = torch.argmax(logits, dim=1).long()
+
+    if not postprocess_eval:
+        return preds
+
+    predictions = preds.cpu().numpy()
+    processed = [postprocess_prediction(mask) for mask in predictions]
+    return torch.from_numpy(np.stack(processed, axis=0)).to(logits.device).long()
+
+
 def run_epoch(
     model: CamusUnet1,
     loader: DataLoader,
@@ -49,15 +85,17 @@ def run_epoch(
     scaler: GradScaler | None = None,
     use_amp: bool = False,
     postprocess: bool = False,
+    max_grad_norm: Optional[float] = None,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
 
     total_loss = 0.0
     metric_sums = {"dice": 0.0, "iou": 0.0, "hausdorff": 0.0, "msd": 0.0}
-    n_batches = 0
+    total_samples = 0
 
     for images, masks in loader:
+        batch_size = images.size(0)
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
@@ -71,27 +109,31 @@ def run_epoch(
         if train_mode:
             if scaler is not None and use_amp:
                 scaler.scale(loss).backward()
+                if max_grad_norm is not None and max_grad_norm > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if max_grad_norm is not None and max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
 
         with torch.no_grad():
-            if postprocess and num_classes == 1:
-                probs = torch.sigmoid(logits)
-                pred = (probs > 0.5).float()
-            else:
-                pred = logits
-
+            pred = prepare_predictions(logits, num_classes, postprocess_eval=postprocess)
             batch_metrics = compute_batch_metrics(pred, masks, num_classes)
-            total_loss += loss.item()
-            for k in metric_sums:
-                metric_sums[k] += batch_metrics[k]
-            n_batches += 1
 
-    out = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
-    out["loss"] = total_loss / max(n_batches, 1)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+        for k, value in batch_metrics.items():
+            metric_sums[k] += value * batch_size
+
+    if total_samples == 0:
+        raise RuntimeError("No samples were processed during epoch")
+
+    out = {k: v / total_samples for k, v in metric_sums.items()}
+    out["loss"] = total_loss / total_samples
     return out
 
 
@@ -103,7 +145,7 @@ def train_one_fold(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Dict[str, float]:
-    fold_dir = args.output
+    fold_dir = args.output / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
     tr_patients, va_patients = train_patients, val_patients
@@ -118,12 +160,19 @@ def train_one_fold(
         test_patients, args.nifti_root, image_size=(args.height, args.width), augment=False, seed=args.seed
     )
 
+    def make_generator(seed: int) -> torch.Generator:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        return g
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        worker_init_fn=seed_worker,
+        generator=make_generator(args.seed),
     )
     val_loader = DataLoader(
         val_ds,
@@ -131,6 +180,8 @@ def train_one_fold(
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        worker_init_fn=seed_worker,
+        generator=make_generator(args.seed + 1),
     )
     test_loader = DataLoader(
         test_ds,
@@ -138,6 +189,8 @@ def train_one_fold(
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        worker_init_fn=seed_worker,
+        generator=make_generator(args.seed + 2),
     )
 
     model = CamusUnet1(
@@ -157,7 +210,8 @@ def train_one_fold(
     use_amp = args.amp and device.type == "cuda"
 
     history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": []}
-    best_val = float("inf")
+    best_val_dice = float("-inf")
+    best_val_loss = float("inf")
     best_path = fold_dir / "best_model.pt"
 
     for epoch in range(1, args.epochs + 1):
@@ -179,8 +233,13 @@ def train_one_fold(
             f"val loss={va['loss']:.4f} dice={va['dice']:.4f}"
         )
 
-        if va["loss"] < best_val:
-            best_val = va["loss"]
+        is_new_best = (
+            va["dice"] > best_val_dice
+            or (va["dice"] == best_val_dice and va["loss"] < best_val_loss)
+        )
+        if is_new_best:
+            best_val_dice = va["dice"]
+            best_val_loss = va["loss"]
             torch.save(
                 {
                     "epoch": epoch,
@@ -202,7 +261,11 @@ def train_one_fold(
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     test_metrics = run_epoch(
-        model, test_loader, device, args.num_classes, postprocess=args.postprocess_eval
+        model,
+        test_loader,
+        device,
+        args.num_classes,
+        postprocess=args.postprocess_eval,
     )
 
     # Save a few overlays from test set
@@ -214,17 +277,13 @@ def train_one_fold(
             images = images.to(device)
             masks = masks.to(device)
             logits = model(images)
+            preds = prepare_predictions(logits, args.num_classes, postprocess_eval=args.postprocess_eval)
             for i in range(images.size(0)):
                 if saved >= args.max_overlays:
                     break
                 img = images[i, 0].cpu().numpy()
                 gt = masks[i].cpu().numpy()
-                if args.num_classes == 1:
-                    pred = (torch.sigmoid(logits[i : i + 1]) > 0.5).squeeze().cpu().numpy().astype(np.uint8)
-                else:
-                    pred = torch.argmax(logits[i : i + 1], dim=1).squeeze().cpu().numpy().astype(np.uint8)
-                if args.postprocess_eval:
-                    pred = postprocess_prediction(pred)
+                pred = preds[i].cpu().numpy().astype(np.uint8)
                 save_overlay(img, gt.astype(np.uint8), pred, overlay_dir / f"sample_{saved:03d}.png")
                 saved += 1
             if saved >= args.max_overlays:
@@ -241,16 +300,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("runs/training"))
     parser.add_argument("--num-classes", type=int, default=4, help="1=binary, >1=multi-class")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training (paper default = 32)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (paper default = 1e-3)")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay regularization (default = 0.0 for paper-style training)")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers (default = 4)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", action="store_false", dest="amp")
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--grad-clip", type=float, default=0.0, help="Max norm for gradient clipping. Set 0 to disable.")
     parser.add_argument("--postprocess-eval", action="store_true", default=True)
     parser.add_argument("--max-overlays", type=int, default=8)
     args = parser.parse_args()
@@ -276,7 +336,6 @@ def main() -> None:
         device=device,
     )
 
-    save_json(args.output / "test_metrics.json", metrics)
     print("Training complete. Results saved to:", args.output)
 
 
