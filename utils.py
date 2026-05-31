@@ -151,6 +151,7 @@ def remove_holes(mask: np.ndarray) -> np.ndarray:
 def postprocess_prediction(
     pred_mask: np.ndarray,
     *,
+    class_ids: Optional[Iterable[int]] = None,
     keep_largest: bool = True,
     fill_holes: bool = True,
 ) -> np.ndarray:
@@ -167,7 +168,8 @@ def postprocess_prediction(
     3. Enforces exclusivity: myocardium excludes LV, atrium excludes LV and myocardium
     
     Args:
-        pred_mask: Shape (H, W) or (C, H, W) where C=4 (background + 3 classes)
+        pred_mask: Shape (H, W) or batch shape (N, H, W) with integer class labels
+        class_ids: Foreground class IDs to process. If omitted, inferred from pred_mask.
         keep_largest: Whether to apply largest_connected_component per class
         fill_holes: Whether to fill holes per class
     
@@ -184,7 +186,15 @@ def postprocess_prediction(
 
     if pred_mask.ndim == 3:
         return np.stack(
-            [postprocess_prediction(mask, keep_largest=keep_largest, fill_holes=fill_holes) for mask in pred_mask],
+            [
+                postprocess_prediction(
+                    mask,
+                    class_ids=class_ids,
+                    keep_largest=keep_largest,
+                    fill_holes=fill_holes,
+                )
+                for mask in pred_mask
+            ],
             axis=0,
         )
 
@@ -194,33 +204,22 @@ def postprocess_prediction(
     output_mask = np.zeros_like(pred_mask, dtype=np.uint8)
     pred_mask = pred_mask.astype(np.int32, copy=False)
 
-    lv_mask = (pred_mask == 1)
-    myocardium_mask = (pred_mask == 2)
-    atrium_mask = (pred_mask == 3)
+    if class_ids is None:
+        class_ids = sorted(int(cls) for cls in np.unique(pred_mask) if int(cls) > 0)
 
-    # Apply configurable per-class post-processing
-    if keep_largest:
-        if POSTPROCESS_CLASSES.get(1, True):
-            lv_mask = largest_connected_component(lv_mask)
-        if POSTPROCESS_CLASSES.get(2, False):
-            myocardium_mask = largest_connected_component(myocardium_mask)
-        if POSTPROCESS_CLASSES.get(3, True):
-            atrium_mask = largest_connected_component(atrium_mask)
+    occupied = np.zeros_like(pred_mask, dtype=bool)
+    for cls in class_ids:
+        cls = int(cls)
+        cls_mask = pred_mask == cls
 
-    if fill_holes:
-        lv_mask = remove_holes(lv_mask)
-        myocardium_mask = remove_holes(myocardium_mask)
-        atrium_mask = remove_holes(atrium_mask)
+        if keep_largest and POSTPROCESS_CLASSES.get(cls, keep_largest):
+            cls_mask = largest_connected_component(cls_mask)
+        if fill_holes:
+            cls_mask = remove_holes(cls_mask)
 
-    # Enforce exclusivity without anatomical constraints
-    # Myocardium must not overlap with LV
-    myocardium_mask = myocardium_mask & ~lv_mask
-    # Atrium must not overlap with LV or myocardium
-    atrium_mask = atrium_mask & ~(lv_mask | myocardium_mask)
-
-    output_mask[lv_mask] = 1
-    output_mask[myocardium_mask] = 2
-    output_mask[atrium_mask] = 3
+        cls_mask = cls_mask & ~occupied
+        output_mask[cls_mask] = cls
+        occupied |= cls_mask
 
     return output_mask
 

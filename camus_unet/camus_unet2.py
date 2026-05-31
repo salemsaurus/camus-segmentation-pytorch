@@ -24,8 +24,10 @@ def double_conv2d(in_channel, out_channel):
 
 
 class CamusUnet2(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=4):
         super(CamusUnet2, self).__init__()
+        if num_classes < 1:
+            raise ValueError("num_classes must be at least 1")
         self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.downConvLayer_1 = double_conv2d(1, 48)
@@ -46,7 +48,7 @@ class CamusUnet2(nn.Module):
         self.upTransConv4 = nn.ConvTranspose2d(in_channels=96, out_channels=48, kernel_size=(2, 2), stride=(2, 2))
         self.upConvLayer_4 = double_conv2d(96, 48)
 
-        self.out = nn.Conv2d(in_channels=48, out_channels=4, kernel_size=(1,1))
+        self.out = nn.Conv2d(in_channels=48, out_channels=num_classes, kernel_size=(1,1))
 
     def forward(self, image):
         """

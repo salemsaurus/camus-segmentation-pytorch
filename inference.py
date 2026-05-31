@@ -45,7 +45,8 @@ def main() -> None:
             pred = torch.argmax(logits, dim=1).squeeze().cpu().numpy().astype(np.uint8)
 
     if args.postprocess:
-        pred = postprocess_prediction(pred)
+        class_ids = (1,) if num_classes == 1 else range(1, num_classes)
+        pred = postprocess_prediction(pred, class_ids=class_ids)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, pred)

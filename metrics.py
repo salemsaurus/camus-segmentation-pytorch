@@ -18,7 +18,10 @@ def _get_metric_class_names(num_classes: int) -> Dict[int, str]:
     """Return label names for metric computation based on mode."""
     if num_classes == 1:
         return {1: "foreground"}
-    return CLASS_NAMES
+    return {
+        cls: CLASS_NAMES.get(cls, f"class_{cls}")
+        for cls in range(1, num_classes)
+    }
 
 
 def _safe_mean(values: list[float]) -> float:
@@ -41,7 +44,7 @@ def _get_class_masks(
 
         if target.ndim == 4:
             target = target.squeeze(1)
-        target_labels = target.long()
+        target_labels = (target > 0).long()
     else:
         if pred.ndim == 4:
             pred_labels = torch.argmax(pred, dim=1).long()

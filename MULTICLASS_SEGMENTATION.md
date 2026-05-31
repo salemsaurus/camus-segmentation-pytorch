@@ -17,21 +17,21 @@ The segmentation task has **4 classes**:
 ### Model Output
 - **Shape**: `[B, 4, H, W]` (batch size, 4 classes, height, width)
 - **Type**: Raw logits (no activation applied)
-- **Purpose**: Input to CrossEntropyLoss
+- **Purpose**: Input to multiclass Dice loss
 
-### Loss Function: CrossEntropyLoss
+### Loss Function: Multiclass Dice Loss
 Located in [losses.py](losses.py)
 
 **Multiclass training**:
 ```python
-criterion = nn.CrossEntropyLoss(reduction="mean")
-loss = criterion(logits, masks.long())
+loss = segmentation_loss(logits, masks, num_classes=4)
 ```
 
 **Requirements**:
 - Logits: `[B, 4, H, W]` (raw, no softmax)
 - Masks: `[B, H, W]` with dtype `torch.long`
 - Mask values: {0, 1, 2, 3}
+- Dice is computed on softmax probabilities for foreground classes 1..3.
 
 ## Metrics: Per-Class Evaluation
 
@@ -155,7 +155,7 @@ Uses:
 - Official 50 validation patients
 - Official 50 test patients
 - 4 classes (num_classes=4 by default)
-- CrossEntropyLoss for multiclass
+- Multiclass Dice loss for classes 1..3
 
 ### Command-line Arguments
 ```bash
@@ -205,13 +205,13 @@ runs/training/
 
 **Multiclass adaptation**:
 - Output layer: `nn.Conv2d(16, 4, kernel_size=1)` (4 classes)
-- No post-hoc activation needed (CrossEntropyLoss expects raw logits)
+- No post-hoc activation needed (the loss applies softmax internally)
 - `forward()` returns raw logits for training
 - Optional `predict()` applies softmax for inference
 
 ## Validation Checklist
 
-✅ Loss function: CrossEntropyLoss (multiclass)
+✅ Loss function: multiclass Dice loss
 ✅ Model output: [B, 4, H, W] logits
 ✅ Mask input: [B, H, W] long tensors with {0,1,2,3}
 ✅ Binary collapsing: Removed from predictions

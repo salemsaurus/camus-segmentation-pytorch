@@ -72,7 +72,8 @@ def prepare_predictions(
         return preds
 
     predictions = preds.cpu().numpy()
-    processed = [postprocess_prediction(mask) for mask in predictions]
+    class_ids = (1,) if num_classes == 1 else range(1, num_classes)
+    processed = [postprocess_prediction(mask, class_ids=class_ids) for mask in predictions]
     return torch.from_numpy(np.stack(processed, axis=0)).to(logits.device).long()
 
 
@@ -105,7 +106,7 @@ def run_epoch(
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
             loss = segmentation_loss(logits, masks, num_classes=num_classes)
 
@@ -168,13 +169,28 @@ def train_one_fold(
     tr_patients, va_patients = train_patients, val_patients
 
     train_ds = CamusPatientDataset(
-        tr_patients, args.nifti_root, image_size=(args.height, args.width), augment=True, seed=args.seed
+        tr_patients,
+        args.nifti_root,
+        image_size=(args.height, args.width),
+        augment=True,
+        seed=args.seed,
+        num_classes=args.num_classes,
     )
     val_ds = CamusPatientDataset(
-        va_patients, args.nifti_root, image_size=(args.height, args.width), augment=False, seed=args.seed
+        va_patients,
+        args.nifti_root,
+        image_size=(args.height, args.width),
+        augment=False,
+        seed=args.seed,
+        num_classes=args.num_classes,
     )
     test_ds = CamusPatientDataset(
-        test_patients, args.nifti_root, image_size=(args.height, args.width), augment=False, seed=args.seed
+        test_patients,
+        args.nifti_root,
+        image_size=(args.height, args.width),
+        augment=False,
+        seed=args.seed,
+        num_classes=args.num_classes,
     )
 
     def make_generator(seed: int) -> torch.Generator:
@@ -376,8 +392,16 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Max norm for gradient clipping. Set 0 to disable.")
     parser.add_argument("--postprocess-eval", action="store_true", default=True)
+    parser.add_argument(
+        "--postprocess-evalsues",
+        action="store_true",
+        dest="postprocess_eval",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--max-overlays", type=int, default=8)
     args = parser.parse_args()
+    if args.num_classes < 1:
+        raise ValueError("--num-classes must be at least 1")
 
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

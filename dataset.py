@@ -63,12 +63,14 @@ class CamusPatientDataset(Dataset):
         image_size: Tuple[int, int] = (256, 256),
         augment: bool = False,
         seed: int = 42,
+        num_classes: int = 4,
     ) -> None:
         self.patients = list(patients)
         self.nifti_root = nifti_root
         self.image_size = image_size
         self.augment = augment
         self.rng = random.Random(seed)
+        self.num_classes = num_classes
         self.samples: List[Tuple[Path, Path]] = []
 
         for patient in self.patients:
@@ -92,53 +94,96 @@ class CamusPatientDataset(Dataset):
         mn, mx = image.min(), image.max()
         return (image - mn) / (mx - mn + 1e-8)
 
-def _augment(
-    self,
-    image: torch.Tensor,
-    mask: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-
-    # Realistic ultrasound augmentations only.
-    if self.rng.random() < 0.5:
-        image = torch.flip(image, dims=[2])
-        mask = torch.flip(mask, dims=[1])
-
-    if self.rng.random() < 0.3:
-        angle = self.rng.uniform(-10, 10)
-        image = self._rotate_image(image, angle)
-        mask = self._rotate_mask(mask, angle)
-
-    if self.rng.random() < 0.3:
-        scale = self.rng.uniform(0.9, 1.1)
-        image = self._scale_image(image, scale)
-        mask = self._scale_mask(mask, scale)
-
-    if self.rng.random() < 0.5:
-        factor = self.rng.uniform(0.85, 1.15)
-        bias = self.rng.uniform(-0.05, 0.05)
-        image = torch.clamp(image * factor + bias, 0.0, 1.0)
-
-    if self.rng.random() < 0.3:
-        noise = torch.randn_like(image) * 0.02
-        image = torch.clamp(image + noise, 0.0, 1.0)
-
-    return image, mask
-
-    def _rotate(self, tensor: torch.Tensor, angle_deg: float) -> torch.Tensor:
-        angle = torch.tensor(angle_deg * np.pi / 180.0)
+    def _rotate(self, tensor: torch.Tensor, angle_deg: float, mode: str) -> torch.Tensor:
+        angle = torch.tensor(angle_deg * np.pi / 180.0, dtype=tensor.dtype, device=tensor.device)
         c, s = torch.cos(angle), torch.sin(angle)
+        theta = torch.stack(
+            [
+                torch.stack([c, -s, torch.zeros((), dtype=tensor.dtype, device=tensor.device)]),
+                torch.stack([s, c, torch.zeros((), dtype=tensor.dtype, device=tensor.device)]),
+            ]
+        ).unsqueeze(0)
         grid = F.affine_grid(
-            torch.tensor([[c, -s, 0.0], [s, c, 0.0]], dtype=tensor.dtype).unsqueeze(0),
+            theta,
             tensor.unsqueeze(0).shape,
             align_corners=False,
         )
-        return F.grid_sample(tensor.unsqueeze(0), grid, mode="bilinear", padding_mode="zeros", align_corners=False).squeeze(0)
+        return F.grid_sample(
+            tensor.unsqueeze(0),
+            grid,
+            mode=mode,
+            padding_mode="zeros",
+            align_corners=False,
+        ).squeeze(0)
 
-    def _scale(self, tensor: torch.Tensor, scale: float) -> torch.Tensor:
+    def _scale(self, tensor: torch.Tensor, scale: float, mode: str) -> torch.Tensor:
         h, w = tensor.shape[-2:]
-        nh, nw = int(h * scale), int(w * scale)
-        scaled = F.interpolate(tensor.unsqueeze(0), size=(nh, nw), mode="bilinear", align_corners=False)
-        return F.interpolate(scaled, size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+        nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+
+        kwargs = {"mode": mode}
+        if mode != "nearest":
+            kwargs["align_corners"] = False
+        scaled = F.interpolate(tensor.unsqueeze(0), size=(nh, nw), **kwargs).squeeze(0)
+
+        if nh > h:
+            top = (nh - h) // 2
+            scaled = scaled[..., top:top + h, :]
+        elif nh < h:
+            pad_top = (h - nh) // 2
+            pad_bottom = h - nh - pad_top
+            scaled = F.pad(scaled, (0, 0, pad_top, pad_bottom))
+
+        if nw > w:
+            left = (nw - w) // 2
+            scaled = scaled[..., :, left:left + w]
+        elif nw < w:
+            pad_left = (w - nw) // 2
+            pad_right = w - nw - pad_left
+            scaled = F.pad(scaled, (pad_left, pad_right, 0, 0))
+
+        return scaled
+
+    def _augment(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Realistic ultrasound augmentations only.
+        if self.rng.random() < 0.5:
+            image = torch.flip(image, dims=[2])
+            mask = torch.flip(mask, dims=[1])
+
+        if self.rng.random() < 0.3:
+            angle = self.rng.uniform(-10, 10)
+            image = self._rotate(image, angle, mode="bilinear")
+            mask = self._rotate(mask.unsqueeze(0).float(), angle, mode="nearest").squeeze(0).long()
+
+        if self.rng.random() < 0.3:
+            scale = self.rng.uniform(0.9, 1.1)
+            image = self._scale(image, scale, mode="bilinear")
+            mask = self._scale(mask.unsqueeze(0).float(), scale, mode="nearest").squeeze(0).long()
+
+        if self.rng.random() < 0.5:
+            factor = self.rng.uniform(0.85, 1.15)
+            bias = self.rng.uniform(-0.05, 0.05)
+            image = torch.clamp(image * factor + bias, 0.0, 1.0)
+
+        if self.rng.random() < 0.3:
+            noise = torch.randn_like(image) * 0.02
+            image = torch.clamp(image + noise, 0.0, 1.0)
+
+        return image, mask
+
+    def _prepare_mask_labels(self, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.long()
+        if self.num_classes == 1:
+            return (mask > 0).long()
+        if mask.numel() and (mask.min() < 0 or mask.max() >= self.num_classes):
+            raise ValueError(
+                f"Mask labels must be in [0, {self.num_classes - 1}], "
+                f"got min={int(mask.min())}, max={int(mask.max())}"
+            )
+        return mask
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         image_path, mask_path = self.samples[idx]
@@ -147,9 +192,11 @@ def _augment(
 
         image = F.interpolate(image, size=self.image_size, mode="bilinear", align_corners=False)
         mask = F.interpolate(mask, size=self.image_size, mode="nearest").squeeze(0).squeeze(0).long()
+        mask = self._prepare_mask_labels(mask)
 
         image = self._normalize(image.squeeze(0))
         if self.augment:
             image, mask = self._augment(image, mask)
+            mask = self._prepare_mask_labels(mask)
 
         return image, mask

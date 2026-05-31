@@ -49,6 +49,8 @@ class CamusUnet1(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if num_classes < 1:
+            raise ValueError("num_classes must be at least 1")
         if not bilinear:
             raise ValueError("Faithful CAMUS U-Net1 reproduction requires bilinear upsampling.")
         self.num_classes = num_classes

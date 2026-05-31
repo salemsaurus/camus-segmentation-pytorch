@@ -5,6 +5,42 @@ import torch
 import torch.nn as nn
 
 
+def _squeeze_targets(targets: torch.Tensor) -> torch.Tensor:
+    if targets.ndim == 4 and targets.size(1) == 1:
+        return targets.squeeze(1)
+    return targets
+
+
+def _validate_multiclass_inputs(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int,
+) -> torch.Tensor:
+    if num_classes < 2:
+        raise ValueError("Multiclass Dice loss requires num_classes >= 2")
+    if logits.ndim != 4:
+        raise ValueError("Expected logits shape [B, C, H, W]")
+    if logits.size(1) != num_classes:
+        raise ValueError(
+            f"Expected logits to have {num_classes} channels, got {logits.size(1)}"
+        )
+
+    targets = _squeeze_targets(targets).long()
+    if targets.ndim != 3:
+        raise ValueError("Expected targets shape [B, H, W] or [B, 1, H, W]")
+    if targets.shape != logits.shape[:1] + logits.shape[2:]:
+        raise ValueError(
+            f"Target shape {tuple(targets.shape)} does not match logits spatial shape "
+            f"{tuple(logits.shape[:1] + logits.shape[2:])}"
+        )
+    if targets.numel() and (targets.min() < 0 or targets.max() >= num_classes):
+        raise ValueError(
+            f"Target labels must be in [0, {num_classes - 1}], "
+            f"got min={int(targets.min())}, max={int(targets.max())}"
+        )
+    return targets
+
+
 def _multiclass_dice_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -13,15 +49,10 @@ def _multiclass_dice_loss(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Compute multiclass Dice loss from logits and integer masks."""
-    if logits.ndim != 4:
-        raise ValueError("Expected logits shape [B, C, H, W]")
-    if targets.ndim == 4:
-        targets = targets.squeeze(1)
+    targets = _validate_multiclass_inputs(logits, targets, num_classes)
 
     probs = torch.softmax(logits, dim=1)
-    targets = targets.long()
 
-    batch_size = logits.size(0)
     losses = []
     for cls in range(num_classes):
         if ignore_background and cls == 0:
@@ -61,8 +92,17 @@ def segmentation_loss(
         - Masks shape: [B, H, W] or [B, 1, H, W], float32
     """
     if num_classes == 1:
+        if logits.ndim != 4 or logits.size(1) != 1:
+            raise ValueError("Binary loss expects logits shape [B, 1, H, W]")
         criterion = nn.BCEWithLogitsLoss()
-        if masks.ndim == 3:
-            masks = masks.unsqueeze(1)
-        return criterion(logits, masks.float())
+        masks = _squeeze_targets(masks)
+        if masks.ndim != 3:
+            raise ValueError("Binary masks must have shape [B, H, W] or [B, 1, H, W]")
+        if masks.shape != logits.shape[:1] + logits.shape[2:]:
+            raise ValueError(
+                f"Mask shape {tuple(masks.shape)} does not match logits spatial shape "
+                f"{tuple(logits.shape[:1] + logits.shape[2:])}"
+            )
+        masks = (masks > 0).float().unsqueeze(1)
+        return criterion(logits, masks)
     return _multiclass_dice_loss(logits, masks, num_classes=num_classes)
