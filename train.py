@@ -92,7 +92,9 @@ def run_epoch(
     model.train(train_mode)
 
     total_loss = 0.0
-    metric_sums = {"dice": 0.0, "iou": 0.0, "hausdorff": 0.0, "msd": 0.0}
+    # Aggregation containers: support arbitrary metric keys returned by compute_batch_metrics
+    metric_sums: Dict[str, float] = {}
+    metric_counts: Dict[str, int] = {}
     total_samples = 0
 
     for images, masks in loader:
@@ -128,12 +130,28 @@ def run_epoch(
         total_loss += loss.item() * batch_size
         total_samples += batch_size
         for k, value in batch_metrics.items():
-            metric_sums[k] += value * batch_size
+            # Initialize containers if first time seeing this metric key
+            if k not in metric_sums:
+                metric_sums[k] = 0.0
+                metric_counts[k] = 0
+            # Only aggregate finite values; keep a per-metric valid-sample count
+            try:
+                v = float(value)
+            except Exception:
+                continue
+            if np.isfinite(v):
+                metric_sums[k] += v * batch_size
+                metric_counts[k] += batch_size
+            # If value is not finite (nan/inf), skip adding but ensure key exists
 
     if total_samples == 0:
         raise RuntimeError("No samples were processed during epoch")
 
-    out = {k: v / total_samples for k, v in metric_sums.items()}
+    # Compute averages per metric using their valid-sample counts
+    out: Dict[str, float] = {}
+    for k, s in metric_sums.items():
+        cnt = metric_counts.get(k, 0)
+        out[k] = float(s / cnt) if cnt > 0 else float("nan")
     out["loss"] = total_loss / total_samples
     return out
 

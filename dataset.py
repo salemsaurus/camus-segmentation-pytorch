@@ -92,32 +92,38 @@ class CamusPatientDataset(Dataset):
         mn, mx = image.min(), image.max()
         return (image - mn) / (mx - mn + 1e-8)
 
-    def _augment(self, image: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Realistic ultrasound augmentations only.
-        if self.rng.random() < 0.5:
-            image = torch.flip(image, dims=[2])
-            mask = torch.flip(mask, dims=[1])
+def _augment(
+    self,
+    image: torch.Tensor,
+    mask: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if self.rng.random() < 0.3:
-            angle = self.rng.uniform(-10, 10)
-            image = self._rotate(image, angle)
-            mask = self._rotate(mask.unsqueeze(0).float(), angle).squeeze(0).long()
+    # Realistic ultrasound augmentations only.
+    if self.rng.random() < 0.5:
+        image = torch.flip(image, dims=[2])
+        mask = torch.flip(mask, dims=[1])
 
-        if self.rng.random() < 0.3:
-            scale = self.rng.uniform(0.9, 1.1)
-            image = self._scale(image, scale)
-            mask = self._scale(mask.unsqueeze(0).float(), scale).squeeze(0).long()
+    if self.rng.random() < 0.3:
+        angle = self.rng.uniform(-10, 10)
+        image = self._rotate_image(image, angle)
+        mask = self._rotate_mask(mask, angle)
 
-        if self.rng.random() < 0.5:
-            factor = self.rng.uniform(0.85, 1.15)
-            bias = self.rng.uniform(-0.05, 0.05)
-            image = torch.clamp(image * factor + bias, 0.0, 1.0)
+    if self.rng.random() < 0.3:
+        scale = self.rng.uniform(0.9, 1.1)
+        image = self._scale_image(image, scale)
+        mask = self._scale_mask(mask, scale)
 
-        if self.rng.random() < 0.3:
-            noise = torch.randn_like(image) * 0.02
-            image = torch.clamp(image + noise, 0.0, 1.0)
+    if self.rng.random() < 0.5:
+        factor = self.rng.uniform(0.85, 1.15)
+        bias = self.rng.uniform(-0.05, 0.05)
+        image = torch.clamp(image * factor + bias, 0.0, 1.0)
 
-        return image, mask
+    if self.rng.random() < 0.3:
+        noise = torch.randn_like(image) * 0.02
+        image = torch.clamp(image + noise, 0.0, 1.0)
+
+    return image, mask
+
     def _rotate(self, tensor: torch.Tensor, angle_deg: float) -> torch.Tensor:
         angle = torch.tensor(angle_deg * np.pi / 180.0)
         c, s = torch.cos(angle), torch.sin(angle)
@@ -126,9 +132,7 @@ class CamusPatientDataset(Dataset):
             tensor.unsqueeze(0).shape,
             align_corners=False,
         )
-        return F.grid_sample(
-            tensor.unsqueeze(0), grid, mode="bilinear", padding_mode="zeros", align_corners=False
-        ).squeeze(0)
+        return F.grid_sample(tensor.unsqueeze(0), grid, mode="bilinear", padding_mode="zeros", align_corners=False).squeeze(0)
 
     def _scale(self, tensor: torch.Tensor, scale: float) -> torch.Tensor:
         h, w = tensor.shape[-2:]
