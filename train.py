@@ -57,6 +57,15 @@ def seed_worker(worker_id: int) -> None:
     torch.manual_seed(worker_seed)
 
 
+def validate_dataset_implementation(dataset: CamusPatientDataset) -> None:
+    if type(dataset).__getitem__ is torch.utils.data.Dataset.__getitem__:
+        raise RuntimeError(
+            "CamusPatientDataset is using PyTorch's base Dataset.__getitem__. "
+            "Update dataset.py so __getitem__ is indented inside the "
+            "CamusPatientDataset class, then restart the Python runtime."
+        )
+
+
 def prepare_predictions(
     logits: torch.Tensor,
     num_classes: int,
@@ -192,6 +201,8 @@ def train_one_fold(
         seed=args.seed,
         num_classes=args.num_classes,
     )
+    for ds in (train_ds, val_ds, test_ds):
+        validate_dataset_implementation(ds)
 
     def make_generator(seed: int) -> torch.Generator:
         g = torch.Generator()
