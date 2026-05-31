@@ -20,6 +20,7 @@ Default hyperparameters are set to the original U-Net1 paper style:
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -214,11 +215,20 @@ def train_one_fold(
     best_val_loss = float("inf")
     best_path = fold_dir / "best_model.pt"
 
+    # Track training time
+    epoch_times = []
+    training_start_time = time.time()
+
     for epoch in range(1, args.epochs + 1):
+        epoch_start_time = time.time()
+        
         tr = run_epoch(
             model, train_loader, device, args.num_classes, optimizer=optimizer, scaler=scaler, use_amp=use_amp
         )
         va = run_epoch(model, val_loader, device, args.num_classes, postprocess=args.postprocess_eval)
+
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
 
         history["train_loss"].append(tr["loss"])
         history["val_loss"].append(va["loss"])
@@ -230,7 +240,8 @@ def train_one_fold(
         print(
             f"epoch {epoch:03d}/{args.epochs} | "
             f"train loss={tr['loss']:.4f} dice={tr['dice']:.4f} | "
-            f"val loss={va['loss']:.4f} dice={va['dice']:.4f}"
+            f"val loss={va['loss']:.4f} dice={va['dice']:.4f} | "
+            f"time={epoch_time:.2f}s"
         )
 
         is_new_best = (
@@ -254,10 +265,14 @@ def train_one_fold(
                 best_path,
             )
 
+    training_total_time = time.time() - training_start_time
+
     save_loss_curves(history, fold_dir / "loss_curve.png")
     save_dice_curves(history, fold_dir / "dice_curve.png")
 
     # Test fold evaluation with best checkpoint
+    test_start_time = time.time()
+    
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     test_metrics = run_epoch(
@@ -267,6 +282,8 @@ def train_one_fold(
         args.num_classes,
         postprocess=args.postprocess_eval,
     )
+    
+    test_time = time.time() - test_start_time
 
     # Save a few overlays from test set
     overlay_dir = fold_dir / "overlays"
@@ -290,6 +307,37 @@ def train_one_fold(
                 break
 
     save_json(fold_dir / "test_metrics.json", test_metrics)
+    
+    # Compute and save timing statistics
+    avg_epoch_time = np.mean(epoch_times) if epoch_times else 0.0
+    min_epoch_time = np.min(epoch_times) if epoch_times else 0.0
+    max_epoch_time = np.max(epoch_times) if epoch_times else 0.0
+    
+    timing_info = {
+        "total_training_time_seconds": training_total_time,
+        "total_training_time_minutes": training_total_time / 60.0,
+        "total_training_time_hours": training_total_time / 3600.0,
+        "average_epoch_time_seconds": avg_epoch_time,
+        "min_epoch_time_seconds": min_epoch_time,
+        "max_epoch_time_seconds": max_epoch_time,
+        "test_evaluation_time_seconds": test_time,
+        "num_epochs": args.epochs,
+    }
+    
+    save_json(fold_dir / "training_time.json", timing_info)
+    
+    # Print timing summary
+    print("\n" + "=" * 70)
+    print("TRAINING TIME SUMMARY")
+    print("=" * 70)
+    print(f"Total training time:  {training_total_time:.1f}s ({training_total_time/60:.1f}m / {training_total_time/3600:.2f}h)")
+    print(f"Average epoch time:   {avg_epoch_time:.2f}s")
+    print(f"Min epoch time:       {min_epoch_time:.2f}s")
+    print(f"Max epoch time:       {max_epoch_time:.2f}s")
+    print(f"Test evaluation time: {test_time:.2f}s")
+    print(f"Total time (incl. test): {training_total_time + test_time:.1f}s ({(training_total_time + test_time)/60:.1f}m)")
+    print("=" * 70 + "\n")
+    
     return test_metrics
 
 
