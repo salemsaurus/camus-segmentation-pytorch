@@ -14,6 +14,13 @@ CLASS_NAMES = {
 }
 
 
+def _get_metric_class_names(num_classes: int) -> Dict[int, str]:
+    """Return label names for metric computation based on mode."""
+    if num_classes == 1:
+        return {1: "foreground"}
+    return CLASS_NAMES
+
+
 def _safe_mean(values: list[float]) -> float:
     """Return the mean of finite values or nan if there are none."""
     valid = [float(v) for v in values if np.isfinite(v)]
@@ -66,13 +73,10 @@ def _has_class(target: np.ndarray, cls: int) -> bool:
 def compute_classwise_dice(
     pred: torch.Tensor, target: torch.Tensor, num_classes: int
 ) -> Dict[str, float]:
-    """Compute classwise Dice scores for CAMUS classes 1-3."""
-    if num_classes == 1:
-        return {}
-
+    """Compute classwise Dice scores for CAMUS classes or binary foreground."""
     pred_m, tgt_m = _get_class_masks(pred, target, num_classes)
     results: Dict[str, float] = {}
-    for cls, name in CLASS_NAMES.items():
+    for cls, name in _get_metric_class_names(num_classes).items():
         scores: list[float] = []
         for p, t in zip(pred_m, tgt_m):
             t_cls = (t == cls)
@@ -89,13 +93,10 @@ def compute_classwise_dice(
 def compute_classwise_iou(
     pred: torch.Tensor, target: torch.Tensor, num_classes: int
 ) -> Dict[str, float]:
-    """Compute classwise IoU scores for CAMUS classes 1-3."""
-    if num_classes == 1:
-        return {}
-
+    """Compute classwise IoU scores for CAMUS classes or binary foreground."""
     pred_m, tgt_m = _get_class_masks(pred, target, num_classes)
     results: Dict[str, float] = {}
-    for cls, name in CLASS_NAMES.items():
+    for cls, name in _get_metric_class_names(num_classes).items():
         scores: list[float] = []
         for p, t in zip(pred_m, tgt_m):
             t_cls = (t == cls)
@@ -136,13 +137,10 @@ def _compute_pairwise_mean_surface_distance(pred_mask: np.ndarray, target_mask: 
 def compute_classwise_hausdorff(
     pred: torch.Tensor, target: torch.Tensor, num_classes: int
 ) -> Dict[str, float]:
-    """Compute classwise Hausdorff distances for CAMUS classes 1-3."""
-    if num_classes == 1:
-        return {}
-
+    """Compute classwise Hausdorff distances for CAMUS classes or binary foreground."""
     pred_m, tgt_m = _get_class_masks(pred, target, num_classes)
     results: Dict[str, float] = {}
-    for cls, name in CLASS_NAMES.items():
+    for cls, name in _get_metric_class_names(num_classes).items():
         distances: list[float] = []
         for p, t in zip(pred_m, tgt_m):
             t_cls = (t == cls)
@@ -157,13 +155,10 @@ def compute_classwise_hausdorff(
 def compute_classwise_msd(
     pred: torch.Tensor, target: torch.Tensor, num_classes: int
 ) -> Dict[str, float]:
-    """Compute classwise mean surface distances for CAMUS classes 1-3."""
-    if num_classes == 1:
-        return {}
-
+    """Compute classwise mean surface distances for CAMUS classes or binary foreground."""
     pred_m, tgt_m = _get_class_masks(pred, target, num_classes)
     results: Dict[str, float] = {}
-    for cls, name in CLASS_NAMES.items():
+    for cls, name in _get_metric_class_names(num_classes).items():
         distances: list[float] = []
         for p, t in zip(pred_m, tgt_m):
             t_cls = (t == cls)

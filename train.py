@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -130,14 +130,12 @@ def run_epoch(
         total_loss += loss.item() * batch_size
         total_samples += batch_size
         for k, value in batch_metrics.items():
-            # Initialize containers if first time seeing this metric key
             if k not in metric_sums:
                 metric_sums[k] = 0.0
                 metric_counts[k] = 0
-            # Only aggregate finite values; keep a per-metric valid-sample count
             try:
                 v = float(value)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
             if np.isfinite(v):
                 metric_sums[k] += v * batch_size
